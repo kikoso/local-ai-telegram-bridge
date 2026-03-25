@@ -1,21 +1,37 @@
 import os
 import subprocess
 import logging
+import keyring
 from typing import List
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from openai import OpenAI
 from dotenv import load_dotenv
 
-# Load environment variables
-load_dotenv()
+# Define the service name for Keychain
+SERVICE_NAME = "local_ai_bridge"
+
+def get_secret(key, default=None):
+    """Retrieve secret from macOS Keychain or environment variable as fallback."""
+    # First, try to get from macOS Keychain
+    secret = keyring.get_password(SERVICE_NAME, key)
+    
+    # If not found in Keychain, try the environment (which might be loaded from .env)
+    if not secret:
+        # Load from .env if it exists
+        load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+        secret = os.getenv(key, default)
+    
+    return secret
 
 # Configuration
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-AUTHORIZED_IDS = [int(i.strip()) for i in os.getenv("AUTHORIZED_USER_IDS", "").split(",") if i.strip()]
-AUTHORIZED_USERNAMES = [u.strip().lower() for u in os.getenv("AUTHORIZED_USERNAMES", "").split(",") if u.strip()]
-LM_STUDIO_API_URL = os.getenv("LM_STUDIO_API_URL", "http://localhost:1234/v1")
-LM_STUDIO_MODEL = os.getenv("LM_STUDIO_MODEL_NAME", "local-model")
+TOKEN = get_secret("TELEGRAM_BOT_TOKEN")
+AUTHORIZED_IDS_STR = get_secret("AUTHORIZED_USER_IDS", "")
+AUTHORIZED_IDS = [int(i.strip()) for i in AUTHORIZED_IDS_STR.split(",") if i.strip()]
+AUTHORIZED_USERNAMES_STR = get_secret("AUTHORIZED_USERNAMES", "")
+AUTHORIZED_USERNAMES = [u.strip().lower() for u in AUTHORIZED_USERNAMES_STR.split(",") if u.strip()]
+LM_STUDIO_API_URL = get_secret("LM_STUDIO_API_URL", "http://localhost:1234/v1")
+LM_STUDIO_MODEL = get_secret("LM_STUDIO_MODEL_NAME", "local-model")
 
 # Initialize Logger
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -70,21 +86,12 @@ async def gemma(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         response = completion.choices[0].message.content
         
-        # Telegram's MarkdownV2 is picky, so we try multiple modes
         try:
-            # Attempt 1: MarkdownV2
-            await status_msg.edit_text(response, parse_mode="MarkdownV2")
+            # Attempt 1: Standard Markdown
+            await status_msg.edit_text(response, parse_mode="Markdown")
         except Exception:
-            try:
-                # Attempt 2: Legacy Markdown
-                await status_msg.edit_text(response, parse_mode="Markdown")
-            except Exception:
-                try:
-                    # Attempt 3: HTML (sometimes better for AI output)
-                    await status_msg.edit_text(response, parse_mode="HTML")
-                except Exception:
-                    # Final Fallback: Plain text
-                    await status_msg.edit_text(response)
+            # Fallback: Plain text
+            await status_msg.edit_text(response)
     except Exception as e:
         logger.error(f"LM Studio API Error: {str(e)}")
         await status_msg.edit_text(f"❌ Error connecting to LM Studio: {str(e)}")
@@ -102,12 +109,11 @@ async def gemini(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     try:
         # Run Gemini CLI in headless mode
-        # Using --approval-mode plan for safety in this bot
         result = subprocess.run(
             ["gemini", "-p", prompt, "--approval-mode", "plan"],
             capture_output=True,
             text=True,
-            timeout=60 # Prevent long-running processes
+            timeout=60
         )
         
         output = result.stdout.strip() if result.returncode == 0 else result.stderr.strip()
@@ -115,7 +121,6 @@ async def gemini(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not output:
             output = "(No output received from Gemini CLI)"
             
-        # Truncate if output exceeds Telegram message limit (4096 chars)
         if len(output) > 4000:
             output = output[:4000] + "\n\n... (Output truncated)"
             
@@ -128,8 +133,8 @@ async def gemini(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text(f"❌ Error running Gemini CLI: {str(e)}")
 
 if __name__ == "__main__":
-    if not TOKEN or TOKEN == "your_bot_token_here":
-        print("❌ ERROR: TELEGRAM_BOT_TOKEN not set in .env file.")
+    if not TOKEN:
+        print("❌ ERROR: TELEGRAM_BOT_TOKEN not found in Keychain or environment.")
         exit(1)
         
     app = ApplicationBuilder().token(TOKEN).build()
@@ -139,5 +144,5 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("gemma", gemma))
     app.add_handler(CommandHandler("gemini", gemini))
     
-    print("🤖 Local AI Bridge Bot is running...")
+    print("🤖 Local AI Bridge Bot is starting...")
     app.run_polling()
