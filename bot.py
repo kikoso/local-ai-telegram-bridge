@@ -8,8 +8,30 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from openai import OpenAI
 from dotenv import load_dotenv
 
+import re
+import html
+
 # Define the service name for Keychain
 SERVICE_NAME = "local_ai_bridge"
+
+def md_to_html(text):
+    """Convert basic Markdown to Telegram-compatible HTML."""
+    # 1. Escape HTML special characters
+    text = html.escape(text)
+    
+    # 2. Convert bold: **text** -> <b>text</b>
+    text = re.sub(r'\*\*([^*]+)\*\*', r'<b>\1</b>', text)
+    
+    # 3. Convert code blocks: ```text``` -> <pre>text</pre>
+    text = re.sub(r'```(.*?)```', r'<pre>\1</pre>', text, flags=re.DOTALL)
+    
+    # 4. Convert inline code: `text` -> <code>text</code>
+    text = re.sub(r'`([^`]+)`', r'<code>\1</code>', text)
+    
+    # 5. Convert italic: *text* -> <i>text</i> (using a non-greedy match)
+    text = re.sub(r'\*([^*]+)\*', r'<i>\1</i>', text)
+    
+    return text
 
 def get_secret(key, default=None):
     """Retrieve secret from macOS Keychain or environment variable as fallback."""
@@ -87,11 +109,16 @@ async def gemma(update: Update, context: ContextTypes.DEFAULT_TYPE):
         response = completion.choices[0].message.content
         
         try:
-            # Attempt 1: Standard Markdown
-            await status_msg.edit_text(response, parse_mode="Markdown")
+            # Attempt 1: Convert Markdown to HTML for reliable bold/italic/code
+            html_response = md_to_html(response)
+            await status_msg.edit_text(html_response, parse_mode="HTML")
         except Exception:
-            # Fallback: Plain text
-            await status_msg.edit_text(response)
+            try:
+                # Attempt 2: Legacy Markdown
+                await status_msg.edit_text(response, parse_mode="Markdown")
+            except Exception:
+                # Final Fallback: Plain text
+                await status_msg.edit_text(response)
     except Exception as e:
         logger.error(f"LM Studio API Error: {str(e)}")
         await status_msg.edit_text(f"❌ Error connecting to LM Studio: {str(e)}")
