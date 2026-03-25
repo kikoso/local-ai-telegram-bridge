@@ -69,7 +69,22 @@ async def gemma(update: Update, context: ContextTypes.DEFAULT_TYPE):
             messages=[{"role": "user", "content": prompt}]
         )
         response = completion.choices[0].message.content
-        await status_msg.edit_text(response)
+        
+        # Telegram's MarkdownV2 is picky, so we try multiple modes
+        try:
+            # Attempt 1: MarkdownV2
+            await status_msg.edit_text(response, parse_mode="MarkdownV2")
+        except Exception:
+            try:
+                # Attempt 2: Legacy Markdown
+                await status_msg.edit_text(response, parse_mode="Markdown")
+            except Exception:
+                try:
+                    # Attempt 3: HTML (sometimes better for AI output)
+                    await status_msg.edit_text(response, parse_mode="HTML")
+                except Exception:
+                    # Final Fallback: Plain text
+                    await status_msg.edit_text(response)
     except Exception as e:
         logger.error(f"LM Studio API Error: {str(e)}")
         await status_msg.edit_text(f"❌ Error connecting to LM Studio: {str(e)}")
