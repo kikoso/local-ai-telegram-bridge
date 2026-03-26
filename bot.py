@@ -145,19 +145,23 @@ async def gemini(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Get current working directory
         cwd = os.getcwd()
         
-        # Try to find gemini executable
+        # Try to find node and gemini
+        node_path = "/opt/homebrew/bin/node"
+        if not os.path.exists(node_path):
+            node_path = "node"
+            
         gemini_path = "/opt/homebrew/bin/gemini"
         if not os.path.exists(gemini_path):
-            # Fallback to just 'gemini' if the absolute path doesn't exist
             gemini_path = "gemini"
 
         # Prepare environment with homebrew paths
         env = os.environ.copy()
         env["PATH"] = f"/opt/homebrew/bin:/usr/local/bin:{env.get('PATH', '')}"
+        logger.info(f"Running: {node_path} {gemini_path} ... with PATH: {env['PATH']}")
 
-        # Run Gemini CLI in headless mode
+        # Run Gemini CLI in headless mode via Node directly
         result = subprocess.run(
-            [gemini_path, "-p", prompt, "--approval-mode", "plan"],
+            [node_path, gemini_path, "-p", prompt, "--approval-mode", "plan"],
             capture_output=True,
             text=True,
             timeout=60,
