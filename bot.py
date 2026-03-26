@@ -151,12 +151,17 @@ async def gemini(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Fallback to just 'gemini' if the absolute path doesn't exist
             gemini_path = "gemini"
 
+        # Prepare environment with homebrew paths
+        env = os.environ.copy()
+        env["PATH"] = f"/opt/homebrew/bin:/usr/local/bin:{env.get('PATH', '')}"
+
         # Run Gemini CLI in headless mode
         result = subprocess.run(
             [gemini_path, "-p", prompt, "--approval-mode", "plan"],
             capture_output=True,
             text=True,
-            timeout=60
+            timeout=60,
+            env=env
         )
         
         output = result.stdout.strip() if result.returncode == 0 else result.stderr.strip()
