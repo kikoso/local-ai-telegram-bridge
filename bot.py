@@ -142,9 +142,18 @@ async def gemini(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_msg = await update.message.reply_text("⏳ Gemini CLI is processing...")
     
     try:
+        # Get current working directory
+        cwd = os.getcwd()
+        
+        # Try to find gemini executable
+        gemini_path = "/opt/homebrew/bin/gemini"
+        if not os.path.exists(gemini_path):
+            # Fallback to just 'gemini' if the absolute path doesn't exist
+            gemini_path = "gemini"
+
         # Run Gemini CLI in headless mode
         result = subprocess.run(
-            ["gemini", "-p", prompt, "--approval-mode", "plan"],
+            [gemini_path, "-p", prompt, "--approval-mode", "plan"],
             capture_output=True,
             text=True,
             timeout=60
@@ -158,7 +167,8 @@ async def gemini(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(output) > 4000:
             output = output[:4000] + "\n\n... (Output truncated)"
             
-        await status_msg.edit_text(f"```\n{output}\n```", parse_mode="Markdown")
+        full_response = f"📂 *CWD:* `{cwd}`\n\n```\n{output}\n```"
+        await status_msg.edit_text(full_response, parse_mode="Markdown")
         
     except subprocess.TimeoutExpired:
         await status_msg.edit_text("❌ Request timed out (60s).")
