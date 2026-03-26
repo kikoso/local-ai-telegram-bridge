@@ -108,6 +108,13 @@ async def gemma(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         response = completion.choices[0].message.content
         
+        if not response:
+            response = "(No response received from local AI)"
+        
+        # Check if the response is too long for Telegram
+        if len(response) > 4000:
+            response = response[:4000] + "\n\n... (Output truncated due to length)"
+        
         try:
             # Attempt 1: Convert Markdown to HTML for reliable bold/italic/code
             html_response = md_to_html(response)
