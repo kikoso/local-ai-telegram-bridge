@@ -17,23 +17,71 @@ import json
 SERVICE_NAME = "local_ai_bridge"
 
 def md_to_html(text):
-    """Convert basic Markdown to Telegram-compatible HTML."""
+    """
+    Convert Markdown to Telegram-compatible HTML.
+    Handles bold, italic, code blocks, inline code, links, and headers.
+    """
     # 1. Escape HTML special characters
     text = html.escape(text)
     
-    # 2. Convert bold: **text** -> <b>text</b>
-    text = re.sub(r'\*\*([^*]+)\*\*', r'<b>\1</b>', text)
+    # 2. Protect code blocks and inline code from other regexes
+    code_elements = []
+    def save_code(match):
+        code_elements.append(match.group(0))
+        return f"<!--CODE_ELEMENT_{len(code_elements)-1}-->"
     
-    # 3. Convert code blocks: ```text``` -> <pre>text</pre>
-    text = re.sub(r'```(.*?)```', r'<pre>\1</pre>', text, flags=re.DOTALL)
+    # Protect triple backticks (code blocks)
+    text = re.sub(r'```(?:\w+)?\n?(.*?)```', save_code, text, flags=re.DOTALL)
+    # Protect single backticks (inline code)
+    text = re.sub(r'`([^`]+)`', save_code, text)
+
+    # 3. Apply formatting to the rest of the text
+    # Headers (convert to bold)
+    text = re.sub(r'^#+\s+(.*)$', r'<b>\1</b>', text, flags=re.MULTILINE)
     
-    # 4. Convert inline code: `text` -> <code>text</code>
-    text = re.sub(r'`([^`]+)`', r'<code>\1</code>', text)
+    # List items: * item -> • item
+    text = re.sub(r'^\s*[\*\-]\s+', r'• ', text, flags=re.MULTILINE)
+
+    # Bold: **text** or __text__
+    text = re.sub(r'(\*\*|__)(.*?)\1', r'<b>\2</b>', text, flags=re.DOTALL)
     
-    # 5. Convert italic: *text* -> <i>text</i> (using a non-greedy match)
-    text = re.sub(r'\*([^*]+)\*', r'<i>\1</i>', text)
+    # Italic: *text* or _text_
+    # Note: We use [^\n] to ensure it doesn't match across lines, which breaks on lists
+    text = re.sub(r'(?<!\w)(?<!\\)([*_])([^\n]+?)\1(?!\w)', r'<i>\2</i>', text)
+    
+    # Links: [text](url)
+    text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'<a href="\2">\1</a>', text)
+
+    # 4. Restore protected code elements
+    def restore_code(match):
+        idx = int(match.group(1))
+        content = code_elements[idx]
+        if content.startswith('```'):
+            # Extract content from block, removing backticks and optional language tag
+            inner = re.sub(r'```(?:\w+)?\n?(.*?)```', r'\1', content, flags=re.DOTALL)
+            return f"<pre>{inner}</pre>"
+        else:
+            # Extract content from inline code
+            inner = re.sub(r'`([^`]+)`', r'\1', content)
+            return f"<code>{inner}</code>"
+
+    text = re.sub(r'<!--CODE_ELEMENT_(\d+)-->', restore_code, text)
     
     return text
+
+async def send_formatted_message(status_msg, response_text):
+    """Send or edit a message with markdown-to-html formatting and fallbacks."""
+    try:
+        # Attempt 1: HTML parse mode with improved conversion
+        html_response = md_to_html(response_text)
+        await status_msg.edit_text(html_response, parse_mode="HTML")
+    except Exception as e:
+        logger.warning(f"HTML parse mode failed, falling back to plain text. Error: {str(e)}")
+        # Final Fallback: Plain text (Markdown V1 is too unstable for AI output)
+        try:
+            await status_msg.edit_text(response_text)
+        except Exception as e2:
+            logger.error(f"Final fallback failed: {str(e2)}")
 
 def get_secret(key, default=None):
     """Retrieve secret from macOS Keychain or environment variable as fallback."""
@@ -108,15 +156,16 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📜 History is currently empty.")
         return
     
-    debug_text = "📜 *Current Gemma History:*\n\n"
+    debug_text = "📜 # Current Gemma History\n\n"
     for msg in history:
         role = msg["role"].capitalize()
         content = msg["content"]
         if len(content) > 100:
             content = content[:100] + "..."
-        debug_text += f"👤 *{role}*: {content}\n"
+        debug_text += f"👤 **{role}**: {content}\n"
     
-    await update.message.reply_text(debug_text, parse_mode="Markdown")
+    html_debug = md_to_html(debug_text)
+    await update.message.reply_text(html_debug, parse_mode="HTML")
 
 async def gemma(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Chat with the local Gemma model via LM Studio with session history."""
@@ -161,16 +210,9 @@ async def gemma(update: Update, context: ContextTypes.DEFAULT_TYPE):
             response = response[:4000] + "\n\n... (Output truncated due to length)"
         
         try:
-            # Attempt 1: Convert Markdown to HTML for reliable bold/italic/code
-            html_response = md_to_html(response)
-            await status_msg.edit_text(html_response, parse_mode="HTML")
-        except Exception:
-            try:
-                # Attempt 2: Legacy Markdown
-                await status_msg.edit_text(response, parse_mode="Markdown")
-            except Exception:
-                # Final Fallback: Plain text
-                await status_msg.edit_text(response)
+            await send_formatted_message(status_msg, response)
+        except Exception as send_err:
+            logger.error(f"Failed to send/edit message: {send_err}")
     except Exception as e:
         logger.error(f"LM Studio API Error: {str(e)}")
         await status_msg.edit_text(f"❌ Error connecting to LM Studio: {str(e)}")
@@ -243,7 +285,10 @@ async def gemini(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(response_text) > 4000:
             response_text = response_text[:4000] + "\n\n... (Output truncated)"
             
-        await status_msg.edit_text(response_text)
+        try:
+            await send_formatted_message(status_msg, response_text)
+        except Exception as send_err:
+            logger.error(f"Failed to send/edit message: {send_err}")
         
     except subprocess.TimeoutExpired:
         await status_msg.edit_text("❌ Request timed out (120s).")
