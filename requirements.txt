@@ -1,5 +1,5 @@
-python-telegram-bot
-openai
-python-dotenv
-httpx
-keyring
+python-telegram-bot==22.5
+openai==2.29.0
+python-dotenv==1.2.1
+httpx==0.28.1
+keyring==25.7.0

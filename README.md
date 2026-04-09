@@ -27,7 +27,7 @@ A secure Telegram bot that bridges user messages to a local **LM Studio** instan
     ```
 
 3.  **Configure Credentials:**
-    - Create a `.env` file with your `TELEGRAM_BOT_TOKEN`, `AUTHORIZED_USER_IDS`, and `AUTHORIZED_USERNAMES`.
+    - Create a `.env` file with your `TELEGRAM_BOT_TOKEN`, `AUTHORIZED_USER_IDS`, `AUTHORIZED_USERNAMES`, `LM_STUDIO_API_URL`, `LM_STUDIO_MODEL_NAME`, and `LM_STUDIO_API_KEY`.
     - Run the migration script to move them to the macOS Keychain:
     ```bash
     python migrate_to_keychain.py
@@ -53,9 +53,12 @@ Message your bot on Telegram with the following commands:
 
 - `/gemma <prompt>` — Chat with your local Gemma model (LM Studio).
 - `/gemini <prompt>` — Execute a command via Gemini CLI.
+- `/reload` — Refresh authorized users and configuration from Keychain.
 - `/start` or `/help` — Show available commands.
 
 ## 🔒 Security
 
-- **Restricted Access:** The bot only responds to the IDs and usernames specified in your Keychain.
+- **Restricted Access:** The bot only responds to the IDs and usernames specified in your Keychain. Use `/reload` after updating secrets.
+- **Input Limits:** Prompts are limited to 2000 characters to ensure stability.
 - **ReadOnly Gemini:** The `/gemini` command is set to `--approval-mode plan` (read-only) by default for safety.
+- **Isolated Environment:** Gemini CLI runs in a sanitized environment to prevent host information leakage.

@@ -22,7 +22,8 @@ def migrate():
         "AUTHORIZED_USER_IDS",
         "AUTHORIZED_USERNAMES",
         "LM_STUDIO_API_URL",
-        "LM_STUDIO_MODEL_NAME"
+        "LM_STUDIO_MODEL_NAME",
+        "LM_STUDIO_API_KEY"
     ]
 
     for secret in secrets:

@@ -16,6 +16,9 @@ import json
 # Define the service name for Keychain
 SERVICE_NAME = "local_ai_bridge"
 
+# Load .env once at startup as a fallback
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+
 def md_to_html(text):
     """
     Convert Markdown to Telegram-compatible HTML.
@@ -88,29 +91,39 @@ def get_secret(key, default=None):
     # First, try to get from macOS Keychain
     secret = keyring.get_password(SERVICE_NAME, key)
     
-    # If not found in Keychain, try the environment (which might be loaded from .env)
-    if not secret:
-        # Load from .env if it exists
-        load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+    # If not found in Keychain, try the environment (might be already loaded from .env)
+    if secret is None:
         secret = os.getenv(key, default)
     
     return secret
 
 # Configuration
 TOKEN = get_secret("TELEGRAM_BOT_TOKEN")
-AUTHORIZED_IDS_STR = get_secret("AUTHORIZED_USER_IDS", "")
-AUTHORIZED_IDS = [int(i.strip()) for i in AUTHORIZED_IDS_STR.split(",") if i.strip()]
-AUTHORIZED_USERNAMES_STR = get_secret("AUTHORIZED_USERNAMES", "")
-AUTHORIZED_USERNAMES = [u.strip().lower() for u in AUTHORIZED_USERNAMES_STR.split(",") if u.strip()]
-LM_STUDIO_API_URL = get_secret("LM_STUDIO_API_URL", "http://localhost:1234/v1")
-LM_STUDIO_MODEL = get_secret("LM_STUDIO_MODEL_NAME", "local-model")
 
 # Initialize Logger
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Initialize LM Studio client (OpenAI-compatible)
-lms_client = OpenAI(base_url=LM_STUDIO_API_URL, api_key="lm-studio")
+def load_config():
+    """Load or reload configuration from secrets."""
+    global AUTHORIZED_IDS, AUTHORIZED_USERNAMES, LM_STUDIO_API_URL, LM_STUDIO_MODEL, LM_STUDIO_API_KEY, lms_client
+    
+    AUTHORIZED_IDS_STR = get_secret("AUTHORIZED_USER_IDS", "")
+    AUTHORIZED_IDS = [int(i.strip()) for i in AUTHORIZED_IDS_STR.split(",") if i.strip()]
+    
+    AUTHORIZED_USERNAMES_STR = get_secret("AUTHORIZED_USERNAMES", "")
+    AUTHORIZED_USERNAMES = [u.strip().lower() for u in AUTHORIZED_USERNAMES_STR.split(",") if u.strip()]
+    
+    LM_STUDIO_API_URL = get_secret("LM_STUDIO_API_URL", "http://localhost:1234/v1")
+    LM_STUDIO_MODEL = get_secret("LM_STUDIO_MODEL_NAME", "local-model")
+    LM_STUDIO_API_KEY = get_secret("LM_STUDIO_API_KEY", "lm-studio")
+    
+    # Re-initialize client if needed
+    lms_client = OpenAI(base_url=LM_STUDIO_API_URL, api_key=LM_STUDIO_API_KEY)
+    logger.info("Configuration loaded/reloaded.")
+
+# Initial load
+load_config()
 
 async def restricted(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Check if the user is authorized by ID or Username."""
@@ -124,6 +137,12 @@ async def restricted(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return False
     return True
 
+async def reload_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Reload configuration from Keychain/Env."""
+    if not await restricted(update, context): return
+    load_config()
+    await update.message.reply_text("✅ Configuration reloaded successfully.")
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Greeting message."""
     if not await restricted(update, context): return
@@ -131,8 +150,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🚀 Local AI Bridge Bot Started!\n\n"
         "Commands:\n"
         "/gemma <prompt> - Chat with local Gemma (persistent sessions)\n"
-        "/gemini <prompt> - Chat with Gemini (Flash, persistent sessions)\n"
+        "/gemini [--auto] <prompt> - Chat with Gemini (Flash, persistent sessions)\n"
+        "  - Use --auto to allow Gemini to execute shell commands (CAUTION)\n"
         "/reset - Start fresh sessions for both AI models\n"
+        "/reload - Refresh configuration from Keychain\n"
         "/help - Show this help message"
     )
 
@@ -167,19 +188,44 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     html_debug = md_to_html(debug_text)
     await update.message.reply_text(html_debug, parse_mode="HTML")
 
+def ensure_alternating_roles(messages: List[dict]) -> List[dict]:
+    """Ensure that message roles alternate between user and assistant."""
+    if not messages:
+        return []
+    
+    new_messages = []
+    for msg in messages:
+        if not new_messages:
+            new_messages.append(msg.copy())
+            continue
+        
+        last_msg = new_messages[-1]
+        # Only merge if it's the same role and not a system message (though system usually only appears once at start)
+        if last_msg["role"] == msg["role"] and msg["role"] != "system":
+            last_msg["content"] += "\n\n" + msg["content"]
+        else:
+            new_messages.append(msg.copy())
+    
+    return new_messages
+
 async def gemma(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Chat with the local Gemma model via LM Studio with session history."""
     if not await restricted(update, context): return
     
     prompt = " ".join(context.args)
     if not prompt:
-        await update.message.reply_text("❓ Please provide a prompt: /gemma <prompt>")
+        await update.message.reply_text(f"❓ Please provide a prompt: /{update.message.text.split()[0][1:]} <prompt>")
+        return
+        
+    if len(prompt) > 2000:
+        await update.message.reply_text("❌ Prompt too long (max 2000 chars).")
         return
 
     status_msg = await update.message.reply_text("⏳ Gemma is thinking...")
     
-    # Session history for Gemma
-    history = context.user_data.get("gemma_history", [])
+    # Session history for Gemma - work on a COPY to avoid corrupting history on failure
+    stored_history = context.user_data.get("gemma_history", [])
+    history = list(stored_history)
     
     # Add System prompt if it's a new conversation
     if not history:
@@ -187,16 +233,20 @@ async def gemma(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     history.append({"role": "user", "content": prompt})
     
-    logger.info(f"Gemma request from user {update.effective_user.id}. Total messages in request: {len(history)}")
+    # Normalize history for LM Studio (some models require strict alternation)
+    normalized_history = ensure_alternating_roles(history)
+    
+    logger.info(f"Gemma request from user {update.effective_user.id}. Total messages in request: {len(normalized_history)}")
     
     try:
         completion = lms_client.chat.completions.create(
             model=LM_STUDIO_MODEL,
-            messages=history
+            messages=normalized_history
         )
         response = completion.choices[0].message.content
         
         if response:
+            # On success, we officially add both the prompt and response to the history
             history.append({"role": "assistant", "content": response})
             # Keep history manageable (e.g., last 20 messages)
             context.user_data["gemma_history"] = history[-20:]
@@ -221,12 +271,27 @@ async def gemini(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Execute Gemini CLI command locally with session persistence."""
     if not await restricted(update, context): return
     
-    prompt = " ".join(context.args)
+    args = list(context.args)
+    approval_mode = "plan"
+    
+    if args and args[0] == "--auto":
+        approval_mode = "auto"
+        args.pop(0)
+        
+    prompt = " ".join(args)
     if not prompt:
-        await update.message.reply_text("❓ Please provide a prompt: /gemini <prompt>")
+        await update.message.reply_text(f"❓ Please provide a prompt: /{update.message.text.split()[0][1:]} [--auto] <prompt>")
+        return
+        
+    if len(prompt) > 2000:
+        await update.message.reply_text("❌ Prompt too long (max 2000 chars).")
         return
 
-    status_msg = await update.message.reply_text("⏳ Gemini (Flash) is processing...")
+    status_text = "⏳ Gemini (Flash) is processing..."
+    if approval_mode == "auto":
+        status_text = "⚠️ Gemini (Flash) is processing in AUTO mode..."
+        
+    status_msg = await update.message.reply_text(status_text)
     
     try:
         # Try to find node and gemini
@@ -238,12 +303,20 @@ async def gemini(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not os.path.exists(gemini_path):
             gemini_path = "gemini"
 
-        # Prepare environment
-        env = os.environ.copy()
-        env["PATH"] = f"/opt/homebrew/bin:/usr/local/bin:{env.get('PATH', '')}"
+        # Prepare a clean environment for subprocess
+        clean_env = {
+            "PATH": f"/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:{os.getenv('PATH', '')}",
+            "HOME": os.path.expanduser("~"),
+            "LANG": os.getenv("LANG", "en_US.UTF-8"),
+            "SHELL": os.getenv("SHELL", "/bin/bash")
+        }
+        
+        # Add any GOOGLE_API_KEY if present in current env
+        if os.getenv("GOOGLE_API_KEY"):
+            clean_env["GOOGLE_API_KEY"] = os.getenv("GOOGLE_API_KEY")
 
         # Base command
-        cmd = [node_path, gemini_path, "-m", "flash", "-p", prompt, "--approval-mode", "plan", "--output-format", "json"]
+        cmd = [node_path, gemini_path, "-m", "flash", "-p", prompt, "--approval-mode", approval_mode, "--output-format", "json"]
         
         # Session persistence: Check if we have a saved session ID for this user
         session_id = context.user_data.get("gemini_session_id")
@@ -256,7 +329,7 @@ async def gemini(update: Update, context: ContextTypes.DEFAULT_TYPE):
             capture_output=True,
             text=True,
             timeout=120, # Increased timeout for potential tool usage
-            env=env
+            env=clean_env
         )
         
         raw_output = result.stdout.strip()
@@ -309,6 +382,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("reset", reset))
+    app.add_handler(CommandHandler("reload", reload_command))
     app.add_handler(CommandHandler("history", history_command))
     app.add_handler(CommandHandler("gemma", gemma))
     app.add_handler(CommandHandler("gemini", gemini))
