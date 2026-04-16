@@ -4,7 +4,7 @@ import logging
 import keyring
 from typing import List
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, PicklePersistence
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes, PicklePersistence
 from openai import OpenAI
 from dotenv import load_dotenv
 
@@ -119,7 +119,7 @@ def load_config():
     LM_STUDIO_API_KEY = get_secret("LM_STUDIO_API_KEY", "lm-studio")
     
     # Re-initialize client if needed
-    lms_client = OpenAI(base_url=LM_STUDIO_API_URL, api_key=LM_STUDIO_API_KEY)
+    lms_client = OpenAI(base_url=LM_STUDIO_API_URL, api_key=LM_STUDIO_API_KEY, timeout=300.0, max_retries=3)
     logger.info("Configuration loaded/reloaded.")
 
 # Initial load
@@ -146,16 +146,60 @@ async def reload_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Greeting message."""
     if not await restricted(update, context): return
+    
+    current_model = context.user_data.get("preferred_model", "None (use commands)")
+    
     await update.message.reply_text(
         "🚀 Local AI Bridge Bot Started!\n\n"
+        f"Current Preferred Model: <b>{current_model}</b>\n\n"
         "Commands:\n"
-        "/gemma <prompt> - Chat with local Gemma (persistent sessions)\n"
-        "/gemini [--auto] <prompt> - Chat with Gemini (Flash, persistent sessions)\n"
+        "/set &lt;model&gt; - Set preferred model (gemini or gemma) for direct messages\n"
+        "/gemma &lt;prompt&gt; - Chat with local Gemma (persistent sessions)\n"
+        "/gemini [--auto] &lt;prompt&gt; - Chat with Gemini (Flash, persistent sessions)\n"
         "  - Use --auto to allow Gemini to execute shell commands (CAUTION)\n"
         "/reset - Start fresh sessions for both AI models\n"
         "/reload - Refresh configuration from Keychain\n"
-        "/help - Show this help message"
+        "/help - Show this help message\n\n"
+        "💡 You can just type your message directly if you have a preferred model set!",
+        parse_mode="HTML"
     )
+
+async def set_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Set the preferred model for direct messages."""
+    if not await restricted(update, context): return
+    
+    if not context.args:
+        await update.message.reply_text("❓ Usage: /set <gemini|gemma>")
+        return
+        
+    model = context.args[0].lower()
+    if model not in ["gemini", "gemma"]:
+        await update.message.reply_text("❌ Invalid model. Use 'gemini' or 'gemma'.")
+        return
+        
+    context.user_data["preferred_model"] = model
+    await update.message.reply_text(f"✅ Preferred model set to: <b>{model}</b>", parse_mode="HTML")
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle direct text messages by routing to the preferred model."""
+    if not await restricted(update, context): return
+    
+    # Ignore if it's a command (already handled by CommandHandlers)
+    if update.message.text.startswith('/'):
+        return
+
+    preferred_model = context.user_data.get("preferred_model")
+    if not preferred_model:
+        await update.message.reply_text("ℹ️ No preferred model set. Use /set <model> or use /gemini or /gemma commands.")
+        return
+
+    # Prepare context.args as if it was a command
+    context.args = update.message.text.split()
+    
+    if preferred_model == "gemini":
+        await gemini(update, context)
+    elif preferred_model == "gemma":
+        await gemma(update, context)
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Display help information."""
@@ -264,8 +308,16 @@ async def gemma(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as send_err:
             logger.error(f"Failed to send/edit message: {send_err}")
     except Exception as e:
-        logger.error(f"LM Studio API Error: {str(e)}")
-        await status_msg.edit_text(f"❌ Error connecting to LM Studio: {str(e)}")
+        error_detail = str(e)
+        if "Read timed out" in error_detail:
+            logger.error(f"LM Studio Timeout: {error_detail}")
+            await status_msg.edit_text("❌ Error connecting to LM Studio: Read Timed Out.\n\n"
+                                     "💡 LM Studio is taking too long to respond. "
+                                     "This usually happens if the model is still loading or your machine is busy. "
+                                     "Try again in a few seconds.")
+        else:
+            logger.error(f"LM Studio API Error: {error_detail}")
+            await status_msg.edit_text(f"❌ Error connecting to LM Studio: {error_detail}")
 
 async def gemini(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Execute Gemini CLI command locally with session persistence."""
@@ -384,8 +436,12 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(CommandHandler("reload", reload_command))
     app.add_handler(CommandHandler("history", history_command))
+    app.add_handler(CommandHandler("set", set_model))
     app.add_handler(CommandHandler("gemma", gemma))
     app.add_handler(CommandHandler("gemini", gemini))
+    
+    # Handle direct text messages
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
     print("🤖 Local AI Bridge Bot is starting...")
     app.run_polling()
