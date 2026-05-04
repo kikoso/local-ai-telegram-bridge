@@ -2,19 +2,23 @@ import os
 import subprocess
 import logging
 import keyring
-from typing import List
+import json
+import re
+import html
+from datetime import datetime
+from pathlib import Path
+from typing import List, Optional
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes, PicklePersistence
 from openai import OpenAI
 from dotenv import load_dotenv
 
-import re
-import html
-
-import json
-
 # Define the service name for Keychain
 SERVICE_NAME = "local_ai_bridge"
+
+# Ensure downloads directory exists
+DOWNLOADS_DIR = Path(__file__).parent / "downloads"
+DOWNLOADS_DIR.mkdir(exist_ok=True)
 
 # Load .env once at startup as a fallback
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
@@ -72,19 +76,50 @@ def md_to_html(text):
     
     return text
 
+def split_message(text, max_length=4000):
+    """Split a message into chunks that fit within Telegram's character limit."""
+    if len(text) <= max_length:
+        return [text]
+    
+    chunks = []
+    while text:
+        if len(text) <= max_length:
+            chunks.append(text)
+            break
+        
+        # Try to find a good place to split (newline)
+        split_at = text.rfind('\n', 0, max_length)
+        if split_at == -1:
+            # No newline, just split at max_length
+            split_at = max_length
+        
+        chunks.append(text[:split_at].strip())
+        text = text[split_at:].strip()
+    
+    return chunks
+
 async def send_formatted_message(status_msg, response_text):
     """Send or edit a message with markdown-to-html formatting and fallbacks."""
-    try:
-        # Attempt 1: HTML parse mode with improved conversion
-        html_response = md_to_html(response_text)
-        await status_msg.edit_text(html_response, parse_mode="HTML")
-    except Exception as e:
-        logger.warning(f"HTML parse mode failed, falling back to plain text. Error: {str(e)}")
-        # Final Fallback: Plain text (Markdown V1 is too unstable for AI output)
+    chunks = split_message(response_text)
+    
+    for i, chunk in enumerate(chunks):
         try:
-            await status_msg.edit_text(response_text)
-        except Exception as e2:
-            logger.error(f"Final fallback failed: {str(e2)}")
+            # Attempt 1: HTML parse mode with improved conversion
+            html_chunk = md_to_html(chunk)
+            if i == 0:
+                await status_msg.edit_text(html_chunk, parse_mode="HTML")
+            else:
+                await status_msg.reply_text(html_chunk, parse_mode="HTML")
+        except Exception as e:
+            logger.warning(f"HTML parse mode failed for chunk {i}, falling back to plain text. Error: {str(e)}")
+            # Final Fallback: Plain text
+            try:
+                if i == 0:
+                    await status_msg.edit_text(chunk)
+                else:
+                    await status_msg.reply_text(chunk)
+            except Exception as e2:
+                logger.error(f"Final fallback failed for chunk {i}: {str(e2)}")
 
 def get_secret(key, default=None):
     """Retrieve secret from macOS Keychain or environment variable as fallback."""
@@ -299,10 +334,6 @@ async def gemma(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not response:
             response = "(No response received from local AI)"
         
-        # Check if the response is too long for Telegram
-        if len(response) > 4000:
-            response = response[:4000] + "\n\n... (Output truncated due to length)"
-        
         try:
             await send_formatted_message(status_msg, response)
         except Exception as send_err:
@@ -319,20 +350,33 @@ async def gemma(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"LM Studio API Error: {error_detail}")
             await status_msg.edit_text(f"❌ Error connecting to LM Studio: {error_detail}")
 
-async def gemini(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def gemini(update: Update, context: ContextTypes.DEFAULT_TYPE, image_path: Optional[str] = None):
     """Execute Gemini CLI command locally with session persistence."""
     if not await restricted(update, context): return
     
-    args = list(context.args)
+    prompt = ""
     approval_mode = "plan"
-    
-    if args and args[0] == "--auto":
-        approval_mode = "auto"
-        args.pop(0)
-        
-    prompt = " ".join(args)
+
+    if image_path:
+        # If called from handle_photo, prompt is the caption
+        raw_caption = update.message.caption if update.message.caption else "Describe this image"
+        # Remove any leading /gemini command from the caption
+        cleaned_caption = re.sub(r'^/gemini(@\w+)?\s*', '', raw_caption, flags=re.IGNORECASE).strip()
+        if not cleaned_caption:
+            cleaned_caption = "Describe this image"
+        prompt = f"@{image_path} {cleaned_caption}"
+    else:
+        # Standard command call
+        args = list(context.args)
+        if args and args[0] == "--auto":
+            approval_mode = "auto"
+            args.pop(0)
+            
+        prompt = " ".join(args)
+
     if not prompt:
-        await update.message.reply_text(f"❓ Please provide a prompt: /{update.message.text.split()[0][1:]} [--auto] <prompt>")
+        command_name = update.message.text.split()[0][1:] if update.message.text else "gemini"
+        await update.message.reply_text(f"❓ Please provide a prompt: /{command_name} [--auto] <prompt>")
         return
         
     if len(prompt) > 2000:
@@ -342,6 +386,8 @@ async def gemini(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_text = "⏳ Gemini (Flash) is processing..."
     if approval_mode == "auto":
         status_text = "⚠️ Gemini (Flash) is processing in AUTO mode..."
+    if image_path:
+        status_text = "📸 Gemini is analyzing the image..."
         
     status_msg = await update.message.reply_text(status_text)
     
@@ -368,7 +414,7 @@ async def gemini(update: Update, context: ContextTypes.DEFAULT_TYPE):
             clean_env["GOOGLE_API_KEY"] = os.getenv("GOOGLE_API_KEY")
 
         # Base command
-        cmd = [node_path, gemini_path, "-m", "flash", "-p", prompt, "--approval-mode", approval_mode, "--output-format", "json"]
+        cmd = [node_path, gemini_path, "-m", "flash", "-p", prompt, "--approval-mode", approval_mode, "--output-format", "json", "--include-directories", "/Users/enriquelopezmanas/"]
         
         # Session persistence: Check if we have a saved session ID for this user
         session_id = context.user_data.get("gemini_session_id")
@@ -407,9 +453,6 @@ async def gemini(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not response_text:
             response_text = "(No output received from Gemini CLI)"
             
-        if len(response_text) > 4000:
-            response_text = response_text[:4000] + "\n\n... (Output truncated)"
-            
         try:
             await send_formatted_message(status_msg, response_text)
         except Exception as send_err:
@@ -420,6 +463,54 @@ async def gemini(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Gemini CLI Execution Error: {str(e)}")
         await status_msg.edit_text(f"❌ Error running Gemini CLI: {str(e)}")
+
+async def download_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional[str]:
+    """Helper to download a photo or document image and return the local path."""
+    if update.message.photo:
+        # Get the highest resolution photo
+        file_obj = update.message.photo[-1]
+    elif update.message.document:
+        file_obj = update.message.document
+    else:
+        return None
+
+    file = await context.bot.get_file(file_obj.file_id)
+    
+    # Create a unique filename
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # Try to get extension from file_path, fallback to .jpg
+    file_extension = Path(file.file_path).suffix if file.file_path else ".jpg"
+    if not file_extension:
+        file_extension = ".jpg"
+        
+    filename = f"media_{update.effective_user.id}_{timestamp}{file_extension}"
+    local_path = DOWNLOADS_DIR / filename
+    
+    # Download the file
+    await file.download_to_drive(custom_path=local_path)
+    logger.info(f"Media downloaded to: {local_path}")
+    return str(local_path)
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle incoming photos, download them, and send to Gemini."""
+    if not await restricted(update, context): return
+
+    image_path = await download_image(update, context)
+    if image_path:
+        await gemini(update, context, image_path=image_path)
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle incoming documents, check if they are images, and send to Gemini."""
+    if not await restricted(update, context): return
+
+    # Check if it's an image
+    if update.message.document.mime_type and update.message.document.mime_type.startswith("image/"):
+        image_path = await download_image(update, context)
+        if image_path:
+            await gemini(update, context, image_path=image_path)
+    else:
+        # We only care about images for now
+        return
 
 if __name__ == "__main__":
     if not TOKEN:
@@ -439,6 +530,10 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("set", set_model))
     app.add_handler(CommandHandler("gemma", gemma))
     app.add_handler(CommandHandler("gemini", gemini))
+    
+    # Handle photos and image documents
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.Document.IMAGE, handle_document))
     
     # Handle direct text messages
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
