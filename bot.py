@@ -399,10 +399,10 @@ async def antigravity(update: Update, context: ContextTypes.DEFAULT_TYPE, image_
         if not os.path.exists(agy_path):
             agy_path = "agy"
 
-        # Prepare a clean environment for subprocess with an isolated HOME directory
+        # Prepare a clean environment for subprocess
         clean_env = {
             "PATH": f"/Users/enriquelopezmanas/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:{os.getenv('PATH', '')}",
-            "HOME": "/Users/enriquelopezmanas/.gemini/telegram-bridge-home",
+            "HOME": os.path.expanduser("~"),
             "LANG": os.getenv("LANG", "en_US.UTF-8"),
             "SHELL": os.getenv("SHELL", "/bin/bash")
         }
