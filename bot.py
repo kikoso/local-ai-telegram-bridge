@@ -442,6 +442,14 @@ async def antigravity(update: Update, context: ContextTypes.DEFAULT_TYPE, image_
         
         response_text = raw_output if raw_output else error_output
 
+        # Clean warning lines from output (e.g. newly created conversation warning)
+        if response_text:
+            lines = []
+            for line in response_text.split('\n'):
+                if not (line.strip().startswith("Warning:") or "not found" in line.lower()):
+                    lines.append(line)
+            response_text = '\n'.join(lines).strip()
+
         if not response_text:
             response_text = "(No output received from Antigravity CLI)"
             
