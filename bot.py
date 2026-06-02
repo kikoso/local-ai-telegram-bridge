@@ -245,6 +245,7 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Reset the current Antigravity and Gemma sessions."""
     if not await restricted(update, context): return
     context.user_data.pop("gemini_session_id", None)
+    context.user_data.pop("antigravity_session_id", None)
     context.user_data.pop("antigravity_started", None)
     context.user_data.pop("gemma_history", None)
     await update.message.reply_text("🔄 AI sessions have been reset.")
@@ -416,13 +417,17 @@ async def antigravity(update: Update, context: ContextTypes.DEFAULT_TYPE, image_
         # Add the workspace directory to keep context
         cmd.extend(["--add-dir", "/Users/enriquelopezmanas/"])
         
-        # Session persistence: continue the most recent conversation unless reset
-        if context.user_data.get("antigravity_started"):
-            cmd.append("--continue")
-            logger.info("Resuming Antigravity session (continuing most recent conversation)")
+        # Session persistence: continue the conversation by UUID
+        session_id = context.user_data.get("antigravity_session_id")
+        if not session_id:
+            import uuid
+            session_id = str(uuid.uuid4())
+            context.user_data["antigravity_session_id"] = session_id
+            logger.info(f"Starting new Antigravity session with ID: {session_id}")
         else:
-            context.user_data["antigravity_started"] = True
-            logger.info("Starting new Antigravity session")
+            logger.info(f"Resuming Antigravity session with ID: {session_id}")
+            
+        cmd.extend(["--conversation", session_id])
 
         result = subprocess.run(
             cmd,
