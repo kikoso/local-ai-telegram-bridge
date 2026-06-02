@@ -188,10 +188,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🚀 Local AI Bridge Bot Started!\n\n"
         f"Current Preferred Model: <b>{current_model}</b>\n\n"
         "Commands:\n"
-        "/set &lt;model&gt; - Set preferred model (gemini or gemma) for direct messages\n"
+        "/set &lt;model&gt; - Set preferred model (antigravity or gemma) for direct messages\n"
         "/gemma &lt;prompt&gt; - Chat with local Gemma (persistent sessions)\n"
-        "/gemini [--auto] &lt;prompt&gt; - Chat with Gemini (Flash, persistent sessions)\n"
-        "  - Use --auto to allow Gemini to execute shell commands (CAUTION)\n"
+        "/antigravity [--auto] &lt;prompt&gt; - Chat with Antigravity (persistent sessions)\n"
+        "  - Use --auto to allow Antigravity to execute shell commands (CAUTION)\n"
         "/reset - Start fresh sessions for both AI models\n"
         "/reload - Refresh configuration from Keychain\n"
         "/help - Show this help message\n\n"
@@ -204,12 +204,12 @@ async def set_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await restricted(update, context): return
     
     if not context.args:
-        await update.message.reply_text("❓ Usage: /set <gemini|gemma>")
+        await update.message.reply_text("❓ Usage: /set <antigravity|gemma>")
         return
         
     model = context.args[0].lower()
-    if model not in ["gemini", "gemma"]:
-        await update.message.reply_text("❌ Invalid model. Use 'gemini' or 'gemma'.")
+    if model not in ["antigravity", "gemini", "gemma"]:
+        await update.message.reply_text("❌ Invalid model. Use 'antigravity' or 'gemma'.")
         return
         
     context.user_data["preferred_model"] = model
@@ -225,14 +225,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     preferred_model = context.user_data.get("preferred_model")
     if not preferred_model:
-        await update.message.reply_text("ℹ️ No preferred model set. Use /set <model> or use /gemini or /gemma commands.")
+        await update.message.reply_text("ℹ️ No preferred model set. Use /set <model> or use /antigravity or /gemma commands.")
         return
 
     # Prepare context.args as if it was a command
     context.args = update.message.text.split()
     
-    if preferred_model == "gemini":
-        await gemini(update, context)
+    if preferred_model in ["antigravity", "gemini"]:
+        await antigravity(update, context)
     elif preferred_model == "gemma":
         await gemma(update, context)
 
@@ -242,9 +242,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start(update, context)
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Reset the current Gemini and Gemma sessions."""
+    """Reset the current Antigravity and Gemma sessions."""
     if not await restricted(update, context): return
     context.user_data.pop("gemini_session_id", None)
+    context.user_data.pop("antigravity_started", None)
     context.user_data.pop("gemma_history", None)
     await update.message.reply_text("🔄 AI sessions have been reset.")
 
@@ -350,8 +351,8 @@ async def gemma(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"LM Studio API Error: {error_detail}")
             await status_msg.edit_text(f"❌ Error connecting to LM Studio: {error_detail}")
 
-async def gemini(update: Update, context: ContextTypes.DEFAULT_TYPE, image_path: Optional[str] = None):
-    """Execute Gemini CLI command locally with session persistence."""
+async def antigravity(update: Update, context: ContextTypes.DEFAULT_TYPE, image_path: Optional[str] = None):
+    """Execute Antigravity CLI command locally with session persistence."""
     if not await restricted(update, context): return
     
     prompt = ""
@@ -360,8 +361,8 @@ async def gemini(update: Update, context: ContextTypes.DEFAULT_TYPE, image_path:
     if image_path:
         # If called from handle_photo, prompt is the caption
         raw_caption = update.message.caption if update.message.caption else "Describe this image"
-        # Remove any leading /gemini command from the caption
-        cleaned_caption = re.sub(r'^/gemini(@\w+)?\s*', '', raw_caption, flags=re.IGNORECASE).strip()
+        # Remove any leading /antigravity or /gemini command from the caption
+        cleaned_caption = re.sub(r'^/(antigravity|gemini)(@\w+)?\s*', '', raw_caption, flags=re.IGNORECASE).strip()
         if not cleaned_caption:
             cleaned_caption = "Describe this image"
         prompt = f"@{image_path} {cleaned_caption}"
@@ -375,7 +376,7 @@ async def gemini(update: Update, context: ContextTypes.DEFAULT_TYPE, image_path:
         prompt = " ".join(args)
 
     if not prompt:
-        command_name = update.message.text.split()[0][1:] if update.message.text else "gemini"
+        command_name = update.message.text.split()[0][1:] if update.message.text else "antigravity"
         await update.message.reply_text(f"❓ Please provide a prompt: /{command_name} [--auto] <prompt>")
         return
         
@@ -383,75 +384,61 @@ async def gemini(update: Update, context: ContextTypes.DEFAULT_TYPE, image_path:
         await update.message.reply_text("❌ Prompt too long (max 2000 chars).")
         return
 
-    status_text = "⏳ Gemini (Flash) is processing..."
+    status_text = "⏳ Antigravity is processing..."
     if approval_mode == "auto":
-        status_text = "⚠️ Gemini (Flash) is processing in AUTO mode..."
+        status_text = "⚠️ Antigravity is processing in AUTO mode..."
     if image_path:
-        status_text = "📸 Gemini is analyzing the image..."
+        status_text = "📸 Antigravity is analyzing the image..."
         
     status_msg = await update.message.reply_text(status_text)
     
     try:
-        # Try to find node and gemini
-        node_path = "/opt/homebrew/bin/node"
-        if not os.path.exists(node_path):
-            node_path = "node"
-            
-        gemini_path = "/opt/homebrew/bin/gemini"
-        if not os.path.exists(gemini_path):
-            gemini_path = "gemini"
+        # Try to find agy binary path
+        agy_path = "/Users/enriquelopezmanas/.local/bin/agy"
+        if not os.path.exists(agy_path):
+            agy_path = "agy"
 
         # Prepare a clean environment for subprocess
         clean_env = {
-            "PATH": f"/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:{os.getenv('PATH', '')}",
+            "PATH": f"/Users/enriquelopezmanas/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:{os.getenv('PATH', '')}",
             "HOME": os.path.expanduser("~"),
             "LANG": os.getenv("LANG", "en_US.UTF-8"),
             "SHELL": os.getenv("SHELL", "/bin/bash")
         }
-        
-        # Add any GOOGLE_API_KEY if present in current env
-        if os.getenv("GOOGLE_API_KEY"):
-            clean_env["GOOGLE_API_KEY"] = os.getenv("GOOGLE_API_KEY")
 
-        # Base command
-        cmd = [node_path, gemini_path, "-m", "flash", "-p", prompt, "--approval-mode", approval_mode, "--output-format", "json", "--include-directories", "/Users/enriquelopezmanas/"]
+        # Base command: run agy directly as it is a compiled binary
+        cmd = [agy_path, "-p", prompt]
         
-        # Session persistence: Check if we have a saved session ID for this user
-        session_id = context.user_data.get("gemini_session_id")
-        if session_id:
-            cmd.extend(["-r", session_id])
-            logger.info(f"Resuming Gemini session: {session_id}")
+        # Auto-approve permissions if `--auto` was requested
+        if approval_mode == "auto":
+            cmd.append("--dangerously-skip-permissions")
+            
+        # Add the workspace directory to keep context
+        cmd.extend(["--add-dir", "/Users/enriquelopezmanas/"])
+        
+        # Session persistence: continue the most recent conversation unless reset
+        if context.user_data.get("antigravity_started"):
+            cmd.append("--continue")
+            logger.info("Resuming Antigravity session (continuing most recent conversation)")
+        else:
+            context.user_data["antigravity_started"] = True
+            logger.info("Starting new Antigravity session")
 
         result = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
-            timeout=120, # Increased timeout for potential tool usage
+            timeout=120, # 2 minutes timeout for potential tool usage
             env=clean_env
         )
         
         raw_output = result.stdout.strip()
         error_output = result.stderr.strip()
         
-        # Try to parse JSON output
-        try:
-            # The output might contain logs before the actual JSON object
-            json_start = raw_output.find('{')
-            if json_start != -1:
-                json_data = json.loads(raw_output[json_start:])
-                response_text = json_data.get("response", "(No response field in JSON)")
-                new_session_id = json_data.get("session_id")
-                
-                if new_session_id:
-                    context.user_data["gemini_session_id"] = new_session_id
-            else:
-                response_text = raw_output if raw_output else error_output
-        except Exception as json_err:
-            logger.error(f"Failed to parse Gemini JSON: {json_err}")
-            response_text = raw_output if raw_output else error_output
+        response_text = raw_output if raw_output else error_output
 
         if not response_text:
-            response_text = "(No output received from Gemini CLI)"
+            response_text = "(No output received from Antigravity CLI)"
             
         try:
             await send_formatted_message(status_msg, response_text)
@@ -461,8 +448,8 @@ async def gemini(update: Update, context: ContextTypes.DEFAULT_TYPE, image_path:
     except subprocess.TimeoutExpired:
         await status_msg.edit_text("❌ Request timed out (120s).")
     except Exception as e:
-        logger.error(f"Gemini CLI Execution Error: {str(e)}")
-        await status_msg.edit_text(f"❌ Error running Gemini CLI: {str(e)}")
+        logger.error(f"Antigravity CLI Execution Error: {str(e)}")
+        await status_msg.edit_text(f"❌ Error running Antigravity CLI: {str(e)}")
 
 async def download_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional[str]:
     """Helper to download a photo or document image and return the local path."""
@@ -492,22 +479,22 @@ async def download_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     return str(local_path)
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle incoming photos, download them, and send to Gemini."""
+    """Handle incoming photos, download them, and send to Antigravity."""
     if not await restricted(update, context): return
 
     image_path = await download_image(update, context)
     if image_path:
-        await gemini(update, context, image_path=image_path)
+        await antigravity(update, context, image_path=image_path)
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle incoming documents, check if they are images, and send to Gemini."""
+    """Handle incoming documents, check if they are images, and send to Antigravity."""
     if not await restricted(update, context): return
 
     # Check if it's an image
     if update.message.document.mime_type and update.message.document.mime_type.startswith("image/"):
         image_path = await download_image(update, context)
         if image_path:
-            await gemini(update, context, image_path=image_path)
+            await antigravity(update, context, image_path=image_path)
     else:
         # We only care about images for now
         return
@@ -529,7 +516,8 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("history", history_command))
     app.add_handler(CommandHandler("set", set_model))
     app.add_handler(CommandHandler("gemma", gemma))
-    app.add_handler(CommandHandler("gemini", gemini))
+    app.add_handler(CommandHandler("antigravity", antigravity))
+    app.add_handler(CommandHandler("gemini", antigravity)) # Legacy alias
     
     # Handle photos and image documents
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))

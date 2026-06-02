@@ -1,11 +1,11 @@
 # Local AI Telegram Bridge 🚀
 
-A secure Telegram bot that bridges user messages to a local **LM Studio** instance (Gemma) and the **Gemini CLI**.
+A secure Telegram bot that bridges user messages to a local **LM Studio** instance (Gemma) and the **Antigravity CLI**.
 
 ## 🌟 Features
 
 - **Local AI (Gemma):** Chat with your locally running model via LM Studio's OpenAI-compatible API.
-- **Gemini CLI Integration:** Execute tasks on your local machine using the Gemini CLI directly from Telegram.
+- **Antigravity CLI Integration:** Execute tasks on your local machine using the Antigravity CLI directly from Telegram.
 - **macOS Keychain Security:** Sensitive credentials (tokens, IDs) are stored in the macOS Keychain, not in plain text.
 - **User-Specific Access:** Restricted by both numeric Telegram ID and username for maximum security.
 - **Markdown-to-HTML:** Intelligent formatting that ensures Gemma's responses look great in Telegram every time.
@@ -52,7 +52,7 @@ This bot is designed to be **always active**. It uses a macOS **LaunchAgent** to
 Message your bot on Telegram with the following commands:
 
 - `/gemma <prompt>` — Chat with your local Gemma model (LM Studio).
-- `/gemini <prompt>` — Execute a command via Gemini CLI.
+- `/antigravity <prompt>` — Execute a command via Antigravity CLI (with `/gemini` legacy alias).
 - `/reload` — Refresh authorized users and configuration from Keychain.
 - `/start` or `/help` — Show available commands.
 
@@ -60,5 +60,5 @@ Message your bot on Telegram with the following commands:
 
 - **Restricted Access:** The bot only responds to the IDs and usernames specified in your Keychain. Use `/reload` after updating secrets.
 - **Input Limits:** Prompts are limited to 2000 characters to ensure stability.
-- **ReadOnly Gemini:** The `/gemini` command is set to `--approval-mode plan` (read-only) by default for safety.
-- **Isolated Environment:** Gemini CLI runs in a sanitized environment to prevent host information leakage.
+- **ReadOnly Antigravity:** The `/antigravity` command is run in safe planning mode by default. Pass `--auto` to auto-approve tool execution (caution!).
+- **Isolated Environment:** Antigravity CLI runs in a sanitized environment to prevent host information leakage.
