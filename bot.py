@@ -5,6 +5,9 @@ import keyring
 import json
 import re
 import html
+import asyncio
+import time
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
@@ -13,8 +16,33 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, fil
 from openai import OpenAI
 from dotenv import load_dotenv
 
+# Try importing Antigravity SDK
+try:
+    from google.antigravity import Agent, LocalAgentConfig, CapabilitiesConfig
+    HAS_SDK = True
+except ImportError:
+    HAS_SDK = False
+
+
 # Define the service name for Keychain
 SERVICE_NAME = "local_ai_bridge"
+
+# Hard cap on a single Antigravity run, so one stuck CLI call can't wedge the bot.
+ANTIGRAVITY_TIMEOUT = 300
+
+# Connectivity watchdog: how often to probe, and how many consecutive
+# failures before we give up and let launchd restart us.
+# Overridable via env so the behaviour can be exercised in tests.
+WATCHDOG_INTERVAL = float(os.getenv("WATCHDOG_INTERVAL", "60"))
+WATCHDOG_MAX_FAILURES = int(os.getenv("WATCHDOG_MAX_FAILURES", "10"))
+
+# Give up on a Keychain read after this long and fall back to .env.
+KEYCHAIN_TIMEOUT = float(os.getenv("KEYCHAIN_TIMEOUT", "10"))
+
+# launchd appends our stderr to bot.err forever; keep it from growing unbounded.
+LOG_MAX_BYTES = 50 * 1024 * 1024
+LOG_KEEP_BYTES = 2 * 1024 * 1024
+LOG_PATH = Path(__file__).parent / "bot.err"
 
 # Ensure downloads directory exists
 DOWNLOADS_DIR = Path(__file__).parent / "downloads"
@@ -121,23 +149,67 @@ async def send_formatted_message(status_msg, response_text):
             except Exception as e2:
                 logger.error(f"Final fallback failed for chunk {i}: {str(e2)}")
 
+# Initialize Logger first, so secret lookups below can report problems.
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# httpx logs every single getUpdates poll at INFO, which is what grew bot.err to 681MB.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
+# Set once we decide the Keychain is unusable for this process's lifetime.
+_keychain_unavailable = False
+
+def _keyring_get_with_timeout(key):
+    """
+    Read one secret from the Keychain, giving up after KEYCHAIN_TIMEOUT.
+
+    At boot launchd starts us before the login Keychain is unlocked, and
+    keyring.get_password() then blocks indefinitely - which once left the bot
+    hung for three days before it ever reached run_polling(). The worker is a
+    daemon thread so an abandoned call can never hold up interpreter exit.
+    """
+    result = {}
+
+    def work():
+        try:
+            result["value"] = keyring.get_password(SERVICE_NAME, key)
+        except Exception as exc:
+            result["error"] = exc
+
+    thread = threading.Thread(target=work, daemon=True)
+    thread.start()
+    thread.join(KEYCHAIN_TIMEOUT)
+
+    if thread.is_alive():
+        raise TimeoutError(f"Keychain lookup for {key} exceeded {KEYCHAIN_TIMEOUT}s")
+    if "error" in result:
+        raise result["error"]
+    return result.get("value")
+
 def get_secret(key, default=None):
     """Retrieve secret from macOS Keychain or environment variable as fallback."""
-    # First, try to get from macOS Keychain
-    secret = keyring.get_password(SERVICE_NAME, key)
-    
+    global _keychain_unavailable
+
+    secret = None
+    if not _keychain_unavailable:
+        try:
+            secret = _keyring_get_with_timeout(key)
+        except TimeoutError as exc:
+            # Locked Keychain. Stop trying for this process - every later
+            # lookup would block just as long - and rely on .env instead.
+            _keychain_unavailable = True
+            logger.warning(f"{exc}. Falling back to environment/.env for all secrets.")
+        except Exception as exc:
+            logger.warning(f"Keychain lookup for {key} failed: {exc}. Falling back to environment.")
+
     # If not found in Keychain, try the environment (might be already loaded from .env)
     if secret is None:
         secret = os.getenv(key, default)
-    
+
     return secret
 
 # Configuration
 TOKEN = get_secret("TELEGRAM_BOT_TOKEN")
-
-# Initialize Logger
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 def load_config():
     """Load or reload configuration from secrets."""
@@ -352,8 +424,19 @@ async def gemma(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"LM Studio API Error: {error_detail}")
             await status_msg.edit_text(f"❌ Error connecting to LM Studio: {error_detail}")
 
+def clean_stream_output(text: str) -> str:
+    """Clean warnings and system logs from the streamed text."""
+    if not text:
+        return ""
+    lines = []
+    for line in text.split('\n'):
+        line_strip = line.strip()
+        if not (line_strip.startswith("Warning:") or "not found" in line_strip.lower() or "new-conversation" in line_strip.lower() or "new conversation" in line_strip.lower()):
+            lines.append(line)
+    return '\n'.join(lines).strip()
+
 async def antigravity(update: Update, context: ContextTypes.DEFAULT_TYPE, image_path: Optional[str] = None):
-    """Execute Antigravity CLI command locally with session persistence."""
+    """Execute Antigravity CLI command locally with session persistence and thought streaming."""
     if not await restricted(update, context): return
     
     prompt = ""
@@ -407,16 +490,6 @@ async def antigravity(update: Update, context: ContextTypes.DEFAULT_TYPE, image_
             "SHELL": os.getenv("SHELL", "/bin/bash")
         }
 
-        # Base command: run agy directly as it is a compiled binary
-        cmd = [agy_path, "-p", prompt]
-        
-        # Auto-approve permissions if `--auto` was requested
-        if approval_mode == "auto":
-            cmd.append("--dangerously-skip-permissions")
-            
-        # Add the workspace directory to keep context
-        cmd.extend(["--add-dir", "/Users/enriquelopezmanas/"])
-        
         # Session persistence: continue the conversation by UUID
         session_id = context.user_data.get("antigravity_session_id")
         if not session_id:
@@ -426,43 +499,136 @@ async def antigravity(update: Update, context: ContextTypes.DEFAULT_TYPE, image_
             logger.info(f"Starting new Antigravity session with ID: {session_id}")
         else:
             logger.info(f"Resuming Antigravity session with ID: {session_id}")
+
+        gemini_api_key = get_secret("GEMINI_API_KEY")
+        
+        # Method 1: Use SDK if installed and Gemini Key is present
+        if HAS_SDK and gemini_api_key:
+            logger.info("Running Antigravity via SDK with thought streaming...")
+            try:
+                os.environ["ANTIGRAVITY_HARNESS_PATH"] = agy_path
+                
+                # Check for auto-approve policies
+                if approval_mode == "auto":
+                    from google.antigravity.hooks import policy
+                    policies = [policy.allow_all()]
+                else:
+                    policies = None
+
+                config = LocalAgentConfig(
+                    api_key=gemini_api_key,
+                    conversation_id=session_id,
+                    workspaces=["/Users/enriquelopezmanas/"],
+                    policies=policies
+                )
+                
+                async with Agent(config) as agent:
+                    response = await agent.chat(prompt)
+                    
+                    accumulated_thoughts = []
+                    last_update_time = 0
+                    
+                    async for thought in response.thoughts:
+                        accumulated_thoughts.append(thought)
+                        current_time = asyncio.get_event_loop().time()
+                        if current_time - last_update_time > 2.0:
+                            preview = "".join(accumulated_thoughts)
+                            # Show thoughts to user
+                            try:
+                                await status_msg.edit_text(f"🧠 **Thinking:**\n{preview}")
+                            except Exception:
+                                pass
+                            last_update_time = current_time
+                    
+                    response_text = await response.get_text()
+                    
+                    if not response_text:
+                        response_text = "(No output received from Antigravity SDK)"
+                        
+                    try:
+                        await send_formatted_message(status_msg, response_text)
+                    except Exception as send_err:
+                        logger.error(f"Failed to send final SDK message: {send_err}")
+                    return
+            except Exception as sdk_err:
+                logger.error(f"Antigravity SDK execution failed, falling back to CLI. Error: {sdk_err}")
+                # Fallback to CLI continues below
+
+        # Method 2: Fallback to running agy CLI asynchronously and streaming stdout
+        logger.info("Running Antigravity via async CLI subprocess...")
+        cmd = [agy_path, "-p", prompt]
+        
+        if approval_mode == "auto":
+            cmd.append("--dangerously-skip-permissions")
             
+        cmd.extend(["--add-dir", "/Users/enriquelopezmanas/"])
         cmd.extend(["--conversation", session_id])
 
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=120, # 2 minutes timeout for potential tool usage
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.DEVNULL,  # never let agy block waiting on stdin
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
             env=clean_env
         )
-        
-        raw_output = result.stdout.strip()
-        error_output = result.stderr.strip()
-        
-        response_text = raw_output if raw_output else error_output
 
-        # Clean warning lines from output (e.g. newly created conversation warning)
-        if response_text:
-            lines = []
-            for line in response_text.split('\n'):
-                if not (line.strip().startswith("Warning:") or "not found" in line.lower()):
-                    lines.append(line)
-            response_text = '\n'.join(lines).strip()
+        accumulated_text = ""
+        last_update_time = 0
 
+        async def stream_output():
+            nonlocal accumulated_text, last_update_time
+            while True:
+                chunk = await process.stdout.read(1024)
+                if not chunk:
+                    break
+
+                text = chunk.decode("utf-8", errors="replace")
+                accumulated_text += text
+
+                # Throttle edits to avoid Telegram rate limits (max 1 edit per 2.0s)
+                current_time = asyncio.get_event_loop().time()
+                if current_time - last_update_time > 2.0:
+                    clean_display = clean_stream_output(accumulated_text)
+                    if clean_display:
+                        try:
+                            # Show live stdout to user
+                            await status_msg.edit_text(f"⏳ **Processing...**\n\n{clean_display}")
+                        except Exception:
+                            pass
+                    last_update_time = current_time
+
+            # Wait for the subprocess to complete
+            await process.wait()
+
+        # Without this the whole bot deadlocks if agy never exits.
+        timed_out = False
+        try:
+            await asyncio.wait_for(stream_output(), timeout=ANTIGRAVITY_TIMEOUT)
+        except asyncio.TimeoutError:
+            timed_out = True
+            logger.error(f"Antigravity CLI timed out after {ANTIGRAVITY_TIMEOUT}s; killing subprocess.")
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            await process.wait()
+
+        # Final cleanup and formatting
+        response_text = clean_stream_output(accumulated_text)
+        if timed_out:
+            notice = f"⏱️ Antigravity timed out after {ANTIGRAVITY_TIMEOUT}s and was stopped."
+            response_text = f"{response_text}\n\n{notice}" if response_text else notice
         if not response_text:
             response_text = "(No output received from Antigravity CLI)"
-            
+
         try:
             await send_formatted_message(status_msg, response_text)
         except Exception as send_err:
-            logger.error(f"Failed to send/edit message: {send_err}")
-        
-    except subprocess.TimeoutExpired:
-        await status_msg.edit_text("❌ Request timed out (120s).")
+            logger.error(f"Failed to send/edit final message: {send_err}")
+            
     except Exception as e:
         logger.error(f"Antigravity CLI Execution Error: {str(e)}")
-        await status_msg.edit_text(f"❌ Error running Antigravity CLI: {str(e)}")
+        await status_msg.edit_text(f"❌ Error running Antigravity: {str(e)}")
 
 async def download_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional[str]:
     """Helper to download a photo or document image and return the local path."""
@@ -512,6 +678,65 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # We only care about images for now
         return
 
+def trim_log_if_large():
+    """
+    Keep bot.err bounded.
+
+    launchd holds this file open in append mode, so truncating in place is safe:
+    its next write still lands at the (new) end. We keep a tail in bot.err.prev
+    so recent history survives the trim.
+    """
+    try:
+        if not LOG_PATH.exists() or LOG_PATH.stat().st_size <= LOG_MAX_BYTES:
+            return
+        with open(LOG_PATH, "rb") as f:
+            f.seek(-LOG_KEEP_BYTES, os.SEEK_END)
+            tail = f.read()
+        Path(str(LOG_PATH) + ".prev").write_bytes(tail)
+        with open(LOG_PATH, "w"):
+            pass
+        logger.info(f"Trimmed {LOG_PATH.name}; previous tail saved to {LOG_PATH.name}.prev")
+    except Exception as exc:
+        logger.warning(f"Could not trim log: {exc}")
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """Log exceptions raised while handling updates instead of dropping them."""
+    logger.error("Exception while handling an update:", exc_info=context.error)
+
+async def connectivity_watchdog(app):
+    """
+    Exit the process if Telegram stays unreachable.
+
+    A long-lived process can get permanently wedged when the network stack
+    changes underneath it (DNS starts failing and never recovers). PTB retries
+    forever without exiting, so launchd's KeepAlive never kicks in and the bot
+    silently stops receiving messages. Exiting gets us a fresh process.
+    """
+    failures = 0
+    while True:
+        await asyncio.sleep(WATCHDOG_INTERVAL)
+        trim_log_if_large()
+        try:
+            await app.bot.get_me()
+            if failures:
+                logger.info(f"Connectivity restored after {failures} failed check(s).")
+            failures = 0
+        except Exception as e:
+            failures += 1
+            logger.error(f"Watchdog check failed ({failures}/{WATCHDOG_MAX_FAILURES}): {e}")
+            if failures >= WATCHDOG_MAX_FAILURES:
+                logger.critical("Telegram unreachable for too long; exiting so launchd restarts the bot.")
+                os._exit(1)
+
+# Module-level reference keeps the task from being garbage collected.
+# (It must not live in bot_data, which PicklePersistence tries to pickle.)
+_watchdog_task = None
+
+async def post_init(app):
+    """Start background tasks once the application is initialized."""
+    global _watchdog_task
+    _watchdog_task = asyncio.create_task(connectivity_watchdog(app))
+
 if __name__ == "__main__":
     if not TOKEN:
         print("❌ ERROR: TELEGRAM_BOT_TOKEN not found in Keychain or environment.")
@@ -520,8 +745,19 @@ if __name__ == "__main__":
     # Persistent storage for sessions
     persistence = PicklePersistence(filepath="bot_data.pickle")
     
-    app = ApplicationBuilder().token(TOKEN).persistence(persistence).build()
-    
+    # concurrent_updates: without it PTB handles updates one at a time, so a
+    # single slow Antigravity call blocks every other message behind it.
+    app = (
+        ApplicationBuilder()
+        .token(TOKEN)
+        .persistence(persistence)
+        .concurrent_updates(True)
+        .post_init(post_init)
+        .build()
+    )
+
+    app.add_error_handler(error_handler)
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("reset", reset))
