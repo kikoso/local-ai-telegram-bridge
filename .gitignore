@@ -6,3 +6,13 @@ __pycache__/
 bot.log
 bot.err
 bot_data.pickle
+
+# Rotated/archived logs - these contain the bot token in httpx request URLs
+bot.log.*
+bot.err.*
+*.pickle
+
+# Local runtime data: Telegram media downloads and scratch caches
+downloads/
+cache/
+venv_backup/
