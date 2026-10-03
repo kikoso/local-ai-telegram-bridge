@@ -30,6 +30,9 @@ SERVICE_NAME = "local_ai_bridge"
 # Hard cap on a single Antigravity run, so one stuck CLI call can't wedge the bot.
 ANTIGRAVITY_TIMEOUT = 300
 
+# Same cap for a single Claude Code CLI run.
+CLAUDE_TIMEOUT = int(os.getenv("CLAUDE_TIMEOUT", "300"))
+
 # Connectivity watchdog: how often to probe, and how many consecutive
 # failures before we give up and let launchd restart us.
 # Overridable via env so the behaviour can be exercised in tests.
@@ -260,10 +263,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🚀 Local AI Bridge Bot Started!\n\n"
         f"Current Preferred Model: <b>{current_model}</b>\n\n"
         "Commands:\n"
-        "/set &lt;model&gt; - Set preferred model (antigravity or gemma) for direct messages\n"
+        "/set &lt;model&gt; - Set preferred model (antigravity, claude or gemma) for direct messages\n"
         "/gemma &lt;prompt&gt; - Chat with local Gemma (persistent sessions)\n"
         "/antigravity [--auto] &lt;prompt&gt; - Chat with Antigravity (persistent sessions)\n"
         "  - Use --auto to allow Antigravity to execute shell commands (CAUTION)\n"
+        "/claude [--auto] &lt;prompt&gt; - Chat with Claude Code CLI (persistent sessions)\n"
+        "  - Use --auto to skip Claude's permission checks (CAUTION)\n"
         "/reset - Start fresh sessions for both AI models\n"
         "/reload - Refresh configuration from Keychain\n"
         "/help - Show this help message\n\n"
@@ -276,12 +281,12 @@ async def set_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await restricted(update, context): return
     
     if not context.args:
-        await update.message.reply_text("❓ Usage: /set <antigravity|gemma>")
+        await update.message.reply_text("❓ Usage: /set <antigravity|claude|gemma>")
         return
-        
+
     model = context.args[0].lower()
-    if model not in ["antigravity", "gemini", "gemma"]:
-        await update.message.reply_text("❌ Invalid model. Use 'antigravity' or 'gemma'.")
+    if model not in ["antigravity", "gemini", "gemma", "claude"]:
+        await update.message.reply_text("❌ Invalid model. Use 'antigravity', 'claude' or 'gemma'.")
         return
         
     context.user_data["preferred_model"] = model
@@ -297,14 +302,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     preferred_model = context.user_data.get("preferred_model")
     if not preferred_model:
-        await update.message.reply_text("ℹ️ No preferred model set. Use /set <model> or use /antigravity or /gemma commands.")
+        await update.message.reply_text("ℹ️ No preferred model set. Use /set <model> or use /antigravity, /claude or /gemma commands.")
         return
 
     # Prepare context.args as if it was a command
     context.args = update.message.text.split()
-    
+
     if preferred_model in ["antigravity", "gemini"]:
         await antigravity(update, context)
+    elif preferred_model == "claude":
+        await claude_code(update, context)
     elif preferred_model == "gemma":
         await gemma(update, context)
 
@@ -314,13 +321,193 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start(update, context)
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Reset the current Antigravity and Gemma sessions."""
+    """Reset the current Antigravity, Claude and Gemma sessions."""
     if not await restricted(update, context): return
     context.user_data.pop("gemini_session_id", None)
     context.user_data.pop("antigravity_session_id", None)
     context.user_data.pop("antigravity_started", None)
+    context.user_data.pop("claude_session_id", None)
+    context.user_data.pop("claude_started", None)
     context.user_data.pop("gemma_history", None)
     await update.message.reply_text("🔄 AI sessions have been reset.")
+
+def describe_tool_use(block: dict) -> str:
+    """One-line summary of a Claude tool call for the live status message."""
+    name = block.get("name", "tool")
+    tool_input = block.get("input") or {}
+    detail = (tool_input.get("command") or tool_input.get("file_path")
+              or tool_input.get("pattern") or tool_input.get("url")
+              or tool_input.get("description") or "")
+    detail = str(detail).replace("\n", " ")
+    if len(detail) > 80:
+        detail = detail[:80] + "…"
+    return f"🔧 {name}: {detail}" if detail else f"🔧 {name}"
+
+async def claude_code(update: Update, context: ContextTypes.DEFAULT_TYPE, image_path: Optional[str] = None):
+    """Run the Claude Code CLI locally with session persistence and live progress."""
+    if not await restricted(update, context): return
+
+    approval_mode = "plan"
+
+    if image_path:
+        raw_caption = update.message.caption if update.message.caption else "Describe this image"
+        cleaned_caption = re.sub(r'^/claude(@\w+)?\s*', '', raw_caption, flags=re.IGNORECASE).strip()
+        if not cleaned_caption:
+            cleaned_caption = "Describe this image"
+        prompt = f"Look at the image at {image_path}. {cleaned_caption}"
+    else:
+        args = list(context.args)
+        if args and args[0] == "--auto":
+            approval_mode = "auto"
+            args.pop(0)
+        prompt = " ".join(args)
+
+    if not prompt:
+        await update.message.reply_text("❓ Please provide a prompt: /claude [--auto] <prompt>")
+        return
+
+    if len(prompt) > 2000:
+        await update.message.reply_text("❌ Prompt too long (max 2000 chars).")
+        return
+
+    status_text = "⏳ Claude is processing..."
+    if approval_mode == "auto":
+        status_text = "⚠️ Claude is processing in AUTO mode..."
+    if image_path:
+        status_text = "📸 Claude is analyzing the image..."
+
+    status_msg = await update.message.reply_text(status_text)
+
+    try:
+        claude_path = os.path.expanduser("~/.local/bin/claude")
+        if not os.path.exists(claude_path):
+            claude_path = "claude"
+
+        home = os.path.expanduser("~")
+        clean_env = {
+            "PATH": f"{home}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:{os.getenv('PATH', '')}",
+            "HOME": home,
+            "USER": os.getenv("USER", os.path.basename(home)),
+            "LANG": os.getenv("LANG", "en_US.UTF-8"),
+            "SHELL": os.getenv("SHELL", "/bin/bash")
+        }
+
+        # Claude stores sessions per working directory, so always run from $HOME
+        # and pick the conversation back up by UUID.
+        session_id = context.user_data.get("claude_session_id")
+        if not session_id:
+            import uuid
+            session_id = str(uuid.uuid4())
+            context.user_data["claude_session_id"] = session_id
+            context.user_data.pop("claude_started", None)
+            logger.info(f"Starting new Claude session with ID: {session_id}")
+        else:
+            logger.info(f"Resuming Claude session with ID: {session_id}")
+
+        cmd = [claude_path, "-p", prompt, "--output-format", "stream-json", "--verbose"]
+        if context.user_data.get("claude_started"):
+            cmd.extend(["--resume", session_id])
+        else:
+            cmd.extend(["--session-id", session_id])
+
+        if approval_mode == "auto":
+            cmd.append("--dangerously-skip-permissions")
+        else:
+            cmd.extend(["--permission-mode", "plan"])
+
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=home,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=clean_env,
+            limit=16 * 1024 * 1024,  # stream-json lines can carry large tool results
+        )
+
+        # Drain stderr concurrently so a chatty CLI can't fill the pipe and block.
+        stderr_task = asyncio.create_task(process.stderr.read())
+
+        progress_lines = []
+        final_text = None
+        is_error = False
+        last_update_time = 0
+
+        async def stream_output():
+            nonlocal final_text, is_error, last_update_time
+            while True:
+                line = await process.stdout.readline()
+                if not line:
+                    break
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                event_type = event.get("type")
+                if event_type == "system" and event.get("subtype") == "init":
+                    # The session now exists on disk; later turns must --resume it.
+                    context.user_data["claude_started"] = True
+                elif event_type == "assistant":
+                    for block in event.get("message", {}).get("content", []):
+                        if block.get("type") == "text" and block.get("text", "").strip():
+                            progress_lines.append(block["text"].strip())
+                        elif block.get("type") == "tool_use":
+                            progress_lines.append(describe_tool_use(block))
+                elif event_type == "result":
+                    final_text = event.get("result")
+                    is_error = bool(event.get("is_error"))
+
+                # Throttle edits to avoid Telegram rate limits (max 1 edit per 2.0s)
+                current_time = asyncio.get_event_loop().time()
+                if progress_lines and current_time - last_update_time > 2.0:
+                    preview = "\n".join(progress_lines[-8:])
+                    if len(preview) > 3500:
+                        preview = "…" + preview[-3500:]
+                    try:
+                        await status_msg.edit_text(f"⏳ Claude is working...\n\n{preview}")
+                    except Exception:
+                        pass
+                    last_update_time = current_time
+
+            await process.wait()
+
+        timed_out = False
+        try:
+            await asyncio.wait_for(stream_output(), timeout=CLAUDE_TIMEOUT)
+        except asyncio.TimeoutError:
+            timed_out = True
+            logger.error(f"Claude CLI timed out after {CLAUDE_TIMEOUT}s; killing subprocess.")
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            await process.wait()
+
+        stderr_text = (await stderr_task).decode("utf-8", errors="replace").strip()
+        if stderr_text:
+            logger.warning(f"Claude CLI stderr: {stderr_text[-2000:]}")
+
+        response_text = final_text if final_text else "\n\n".join(
+            line for line in progress_lines if not line.startswith("🔧"))
+        if is_error:
+            response_text = f"❌ Claude reported an error:\n{response_text}"
+        if timed_out:
+            notice = f"⏱️ Claude timed out after {CLAUDE_TIMEOUT}s and was stopped."
+            response_text = f"{response_text}\n\n{notice}" if response_text else notice
+        if not response_text:
+            response_text = f"❌ No output from Claude CLI (exit code {process.returncode})."
+            if stderr_text:
+                response_text += f"\n\n{stderr_text[-1000:]}"
+
+        try:
+            await send_formatted_message(status_msg, response_text)
+        except Exception as send_err:
+            logger.error(f"Failed to send/edit final Claude message: {send_err}")
+
+    except Exception as e:
+        logger.error(f"Claude CLI Execution Error: {str(e)}")
+        await status_msg.edit_text(f"❌ Error running Claude: {str(e)}")
 
 async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Debug command to show current Gemma history."""
@@ -657,13 +844,23 @@ async def download_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     logger.info(f"Media downloaded to: {local_path}")
     return str(local_path)
 
+async def route_image(update: Update, context: ContextTypes.DEFAULT_TYPE, image_path: str):
+    """Send an image to Claude if the caption or preferred model asks for it, else Antigravity."""
+    caption = (update.message.caption or "").lower()
+    if caption.startswith("/claude") or (
+            context.user_data.get("preferred_model") == "claude"
+            and not re.match(r'^/(antigravity|gemini)\b', caption)):
+        await claude_code(update, context, image_path=image_path)
+    else:
+        await antigravity(update, context, image_path=image_path)
+
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle incoming photos, download them, and send to Antigravity."""
     if not await restricted(update, context): return
 
     image_path = await download_image(update, context)
     if image_path:
-        await antigravity(update, context, image_path=image_path)
+        await route_image(update, context, image_path)
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle incoming documents, check if they are images, and send to Antigravity."""
@@ -673,7 +870,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.document.mime_type and update.message.document.mime_type.startswith("image/"):
         image_path = await download_image(update, context)
         if image_path:
-            await antigravity(update, context, image_path=image_path)
+            await route_image(update, context, image_path)
     else:
         # We only care about images for now
         return
@@ -767,6 +964,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("gemma", gemma))
     app.add_handler(CommandHandler("antigravity", antigravity))
     app.add_handler(CommandHandler("gemini", antigravity)) # Legacy alias
+    app.add_handler(CommandHandler("claude", claude_code))
     
     # Handle photos and image documents
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))

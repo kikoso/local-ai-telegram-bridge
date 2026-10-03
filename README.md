@@ -1,11 +1,12 @@
 # Local AI Telegram Bridge 🚀
 
-A secure Telegram bot that bridges user messages to a local **LM Studio** instance (Gemma) and the **Antigravity CLI**.
+A secure Telegram bot that bridges user messages to a local **LM Studio** instance (Gemma), the **Antigravity CLI** and the **Claude Code CLI**.
 
 ## 🌟 Features
 
 - **Local AI (Gemma):** Chat with your locally running model via LM Studio's OpenAI-compatible API.
 - **Antigravity CLI Integration:** Execute tasks on your local machine using the Antigravity CLI directly from Telegram.
+- **Claude Code CLI Integration:** Chat with Claude Code (`claude -p`) with persistent sessions and live tool-use progress. Requires the `claude` CLI installed and logged in (`~/.local/bin/claude`).
 - **macOS Keychain Security:** Sensitive credentials (tokens, IDs) are stored in the macOS Keychain, not in plain text.
 - **User-Specific Access:** Restricted by both numeric Telegram ID and username for maximum security.
 - **Markdown-to-HTML:** Intelligent formatting that ensures Gemma's responses look great in Telegram every time.
@@ -53,6 +54,9 @@ Message your bot on Telegram with the following commands:
 
 - `/gemma <prompt>` — Chat with your local Gemma model (LM Studio).
 - `/antigravity <prompt>` — Execute a command via Antigravity CLI (with `/gemini` legacy alias).
+- `/claude [--auto] <prompt>` — Chat with Claude Code CLI. Sessions persist until `/reset`. Send a photo with a `/claude` caption (or with `/set claude`) to have Claude analyze it.
+- `/set <antigravity|claude|gemma>` — Pick the model that plain (non-command) messages go to.
+- `/reset` — Start fresh sessions for all models.
 - `/reload` — Refresh authorized users and configuration from Keychain.
 - `/start` or `/help` — Show available commands.
 
@@ -61,4 +65,5 @@ Message your bot on Telegram with the following commands:
 - **Restricted Access:** The bot only responds to the IDs and usernames specified in your Keychain. Use `/reload` after updating secrets.
 - **Input Limits:** Prompts are limited to 2000 characters to ensure stability.
 - **ReadOnly Antigravity:** The `/antigravity` command is run in safe planning mode by default. Pass `--auto` to auto-approve tool execution (caution!).
+- **ReadOnly Claude:** `/claude` runs in Claude Code's `plan` permission mode by default. `--auto` passes `--dangerously-skip-permissions` (caution!). Runs are capped at `CLAUDE_TIMEOUT` seconds (default 300).
 - **Isolated Environment:** Antigravity CLI runs in a sanitized environment to prevent host information leakage.
