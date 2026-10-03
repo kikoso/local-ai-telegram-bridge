@@ -7,6 +7,7 @@ A secure Telegram bot that bridges user messages to a local **LM Studio** instan
 - **Local AI (Gemma):** Chat with your locally running model via LM Studio's OpenAI-compatible API.
 - **Antigravity CLI Integration:** Execute tasks on your local machine using the Antigravity CLI directly from Telegram.
 - **Claude Code CLI Integration:** Chat with Claude Code (`claude -p`) with persistent sessions and live tool-use progress. Requires the `claude` CLI installed and logged in (`~/.local/bin/claude`).
+- **Bridge-Aware Models:** Every model gets a standing system prompt (`BRIDGE_CONTEXT` in `bot.py`) explaining that it's reached through this Telegram bridge on your Mac, so it answers phone-friendly and knows its tools run on your machine. Edit that constant to change what they're told.
 - **macOS Keychain Security:** Sensitive credentials (tokens, IDs) are stored in the macOS Keychain, not in plain text.
 - **User-Specific Access:** Restricted by both numeric Telegram ID and username for maximum security.
 - **Markdown-to-HTML:** Intelligent formatting that ensures Gemma's responses look great in Telegram every time.

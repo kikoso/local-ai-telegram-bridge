@@ -51,6 +51,38 @@ LOG_PATH = Path(__file__).parent / "bot.err"
 DOWNLOADS_DIR = Path(__file__).parent / "downloads"
 DOWNLOADS_DIR.mkdir(exist_ok=True)
 
+# Standing context given to every model, so each one knows it is answering
+# through this bridge rather than in a normal chat or terminal.
+BRIDGE_CONTEXT = """\
+You are being accessed through "Local AI Bridge", a personal Telegram bot that \
+runs on the user's own Mac (macOS) and relays their messages to local AI tools: \
+Claude Code CLI (/claude), Antigravity CLI (/antigravity) and a local Gemma model \
+in LM Studio (/gemma). You are currently: {model}.
+
+- The user is chatting from the Telegram app, usually on their phone, and is \
+not sitting at the Mac. They cannot see a terminal, click links to localhost, \
+or approve interactive prompts.
+- Tools and commands you run execute on the user's Mac, under their account, \
+with their home directory as the working area. Treat their machine with care.
+- Your reply is sent back as Telegram messages. Keep answers concise and \
+phone-friendly. Basic Markdown (bold, italic, `code`, code blocks, links, \
+bullet lists) is converted for Telegram; tables and nested formatting are not, \
+so avoid them. Long replies are split into ~4000-character messages.
+- By default the bridge runs you in a read-only/plan mode. If an action needs \
+more permissions, say so: the user can resend with --auto to allow it.
+- Photos the user sends are saved into the bridge's downloads folder and \
+referenced by path in the prompt.
+- Bridge commands the user can use: /set <model> picks the default model for \
+plain messages, /reset starts fresh conversations, /help lists commands.
+"""
+
+def bridge_context(model: str) -> str:
+    return BRIDGE_CONTEXT.format(model=model)
+
+def with_bridge_context(model: str, prompt: str) -> str:
+    """Prefix a prompt with the bridge context, for CLIs without a system-prompt flag."""
+    return f"<bridge_context>\n{bridge_context(model)}</bridge_context>\n\n{prompt}"
+
 # Load .env once at startup as a fallback
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
@@ -404,7 +436,8 @@ async def claude_code(update: Update, context: ContextTypes.DEFAULT_TYPE, image_
         else:
             logger.info(f"Resuming Claude session with ID: {session_id}")
 
-        cmd = [claude_path, "-p", prompt, "--output-format", "stream-json", "--verbose"]
+        cmd = [claude_path, "-p", prompt, "--output-format", "stream-json", "--verbose",
+               "--append-system-prompt", bridge_context("Claude Code (Anthropic)")]
         if context.user_data.get("claude_started"):
             cmd.extend(["--resume", session_id])
         else:
@@ -567,9 +600,10 @@ async def gemma(update: Update, context: ContextTypes.DEFAULT_TYPE):
     stored_history = context.user_data.get("gemma_history", [])
     history = list(stored_history)
     
-    # Add System prompt if it's a new conversation
-    if not history:
-        history.append({"role": "system", "content": "You are a helpful AI assistant. You have a conversation history provided to you. Use this history to provide context-aware answers. Do NOT say you have no memory, because the memory is being provided to you in this message list."})
+    # Always lead with the current system prompt. Stored history may hold an
+    # old one, or none at all once the 20-message trim has cut it off.
+    history = [m for m in history if m["role"] != "system"]
+    history.insert(0, {"role": "system", "content": bridge_context("Gemma, a local model running in LM Studio") + "\nYou have a conversation history provided to you. Use this history to provide context-aware answers. Do NOT say you have no memory, because the memory is being provided to you in this message list."})
     
     history.append({"role": "user", "content": prompt})
     
@@ -654,6 +688,8 @@ async def antigravity(update: Update, context: ContextTypes.DEFAULT_TYPE, image_
     if len(prompt) > 2000:
         await update.message.reply_text("❌ Prompt too long (max 2000 chars).")
         return
+
+    prompt = with_bridge_context("Antigravity CLI (Google)", prompt)
 
     status_text = "⏳ Antigravity is processing..."
     if approval_mode == "auto":
