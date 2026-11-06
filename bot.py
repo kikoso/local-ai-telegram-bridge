@@ -8,6 +8,7 @@ import html
 import asyncio
 import time
 import threading
+import socket
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
@@ -301,6 +302,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  - Use --auto to allow Antigravity to execute shell commands (CAUTION)\n"
         "/claude [--auto] &lt;prompt&gt; - Chat with Claude Code CLI (persistent sessions)\n"
         "  - Use --auto to skip Claude's permission checks (CAUTION)\n"
+        "/wake - Turn on the PC (Wake-on-LAN)\n"
+        "/pcstatus - Is the PC on?\n"
         "/reset - Start fresh sessions for both AI models\n"
         "/reload - Refresh configuration from Keychain\n"
         "/help - Show this help message\n\n"
@@ -961,6 +964,60 @@ async def connectivity_watchdog(app):
                 logger.critical("Telegram unreachable for too long; exiting so launchd restarts the bot.")
                 os._exit(1)
 
+# --- PC power: /wake and /pcstatus (no model involved) ---
+# The values live in the Keychain (service local_ai_bridge) or .env, never in this public repo:
+#   PC_MAC        MAC address of the PC's Ethernet port
+#   PC_BROADCAST  comma-separated broadcast addresses (default 255.255.255.255); add the LAN's
+#                 own (e.g. 192.168.1.255) so the packet doesn't leave via Tailscale or a VPN
+#   PC_HOST       name or IP that /pcstatus pings (e.g. its Tailscale IP)
+WOL_PORTS = (9, 7)
+
+
+def magic_packet(mac):
+    digits = re.sub(r"[^0-9A-Fa-f]", "", mac or "")
+    if len(digits) != 12:
+        raise ValueError("PC_MAC is missing or not a valid MAC address")
+    return b"\xff" * 6 + bytes.fromhex(digits) * 16
+
+
+def send_magic_packet(mac, broadcasts):
+    packet = magic_packet(mac)
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        for address in broadcasts:
+            for port in WOL_PORTS:
+                sock.sendto(packet, (address, port))
+
+
+async def wake_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send a Wake-on-LAN magic packet to the PC."""
+    if not await restricted(update, context): return
+    broadcasts = [b.strip() for b in (get_secret("PC_BROADCAST") or "255.255.255.255").split(",") if b.strip()]
+    try:
+        send_magic_packet(get_secret("PC_MAC"), broadcasts)
+    except Exception as exc:
+        logger.error(f"Wake-on-LAN failed: {exc}")
+        await update.message.reply_text(f"❌ No se pudo enviar el paquete: {exc}")
+        return
+    logger.info("Wake-on-LAN packet sent")
+    await update.message.reply_text("Paquete enviado. El PC debería arrancar en unos segundos.")
+
+
+async def pcstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ping the PC and say whether it is on."""
+    if not await restricted(update, context): return
+    host = get_secret("PC_HOST")
+    if not host:
+        await update.message.reply_text("❌ PC_HOST is not configured.")
+        return
+    proc = await asyncio.create_subprocess_exec(
+        "/sbin/ping", "-c", "2", "-t", "4", host,
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+    on = await proc.wait() == 0
+    await update.message.reply_text("🟢 El PC está encendido." if on else
+                                    "⚫ El PC está apagado (o aún arrancando).")
+
+
 # Module-level reference keeps the task from being garbage collected.
 # (It must not live in bot_data, which PicklePersistence tries to pickle.)
 _watchdog_task = None
@@ -1001,6 +1058,8 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("antigravity", antigravity))
     app.add_handler(CommandHandler("gemini", antigravity)) # Legacy alias
     app.add_handler(CommandHandler("claude", claude_code))
+    app.add_handler(CommandHandler("wake", wake_command))
+    app.add_handler(CommandHandler("pcstatus", pcstatus_command))
     
     # Handle photos and image documents
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))

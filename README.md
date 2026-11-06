@@ -57,9 +57,23 @@ Message your bot on Telegram with the following commands:
 - `/antigravity <prompt>` — Execute a command via Antigravity CLI (with `/gemini` legacy alias).
 - `/claude [--auto] <prompt>` — Chat with Claude Code CLI. Sessions persist until `/reset`. Send a photo with a `/claude` caption (or with `/set claude`) to have Claude analyze it.
 - `/set <antigravity|claude|gemma>` — Pick the model that plain (non-command) messages go to.
+- `/wake` — Turn on a PC on the same network with Wake-on-LAN. Runs directly, no model involved.
+- `/pcstatus` — Ping the PC and say whether it's on.
 - `/reset` — Start fresh sessions for all models.
 - `/reload` — Refresh authorized users and configuration from Keychain.
 - `/start` or `/help` — Show available commands.
+
+## 🖥️ Waking a PC
+
+`/wake` sends a Wake-on-LAN magic packet (UDP ports 9 and 7, standard library only); `/pcstatus` pings the PC. Configure them in the Keychain (or `.env`), never in the code:
+
+```bash
+security add-generic-password -U -s local_ai_bridge -a PC_MAC -w 'AA:BB:CC:DD:EE:FF'
+security add-generic-password -U -s local_ai_bridge -a PC_BROADCAST -w '192.168.1.255,255.255.255.255'
+security add-generic-password -U -s local_ai_bridge -a PC_HOST -w '<PC IP or name, e.g. its Tailscale IP>'
+```
+
+`PC_BROADCAST` defaults to `255.255.255.255`; adding your LAN's own broadcast address keeps the packet from leaving through Tailscale or a VPN. On the PC: enable Wake-on-LAN in the BIOS, "Wake on Magic Packet" on the network adapter, and turn off Windows Fast Startup. The PC needs a cable to the router.
 
 ## 🔒 Security
 
