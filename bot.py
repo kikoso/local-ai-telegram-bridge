@@ -981,12 +981,27 @@ def magic_packet(mac):
 
 
 def send_magic_packet(mac, broadcasts):
+    """Send to every address; return the ones that worked. Raise only if none did.
+
+    Under launchd, 255.255.255.255 can fail with "No route to host" while the LAN's
+    own broadcast works fine, so one failing address must not abort the rest.
+    """
     packet = magic_packet(mac)
+    sent, errors = [], []
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         for address in broadcasts:
-            for port in WOL_PORTS:
-                sock.sendto(packet, (address, port))
+            try:
+                for port in WOL_PORTS:
+                    sock.sendto(packet, (address, port))
+                sent.append(address)
+            except OSError as exc:
+                errors.append(f"{address}: {exc}")
+    if errors:
+        logger.warning(f"Wake-on-LAN failed for some addresses: {'; '.join(errors)}")
+    if not sent:
+        raise OSError("; ".join(errors))
+    return sent
 
 
 async def wake_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -994,12 +1009,12 @@ async def wake_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await restricted(update, context): return
     broadcasts = [b.strip() for b in (get_secret("PC_BROADCAST") or "255.255.255.255").split(",") if b.strip()]
     try:
-        send_magic_packet(get_secret("PC_MAC"), broadcasts)
+        sent = send_magic_packet(get_secret("PC_MAC"), broadcasts)
     except Exception as exc:
         logger.error(f"Wake-on-LAN failed: {exc}")
         await update.message.reply_text(f"❌ No se pudo enviar el paquete: {exc}")
         return
-    logger.info("Wake-on-LAN packet sent")
+    logger.info(f"Wake-on-LAN packet sent to {', '.join(sent)}")
     await update.message.reply_text("Paquete enviado. El PC debería arrancar en unos segundos.")
 
 
